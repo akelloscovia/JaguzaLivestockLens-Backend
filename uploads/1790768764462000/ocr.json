@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "capture_id": "1790768764462000",
+  "captured_at": "2026-09-30T11:46:12.149Z",
+  "image": {
+    "width": 512,
+    "height": 512,
+    "mime_type": "image/png"
+  },
+  "tag_region": null,
+  "tag_texts": [],
+  "tag_detections": [],
+  "tag_crop": null,
+  "ocr": {
+    "engine": "google_ml_kit_text_recognition",
+    "tag_id": "",
+    "text": "",
+    "confidence": null,
+    "local_text": null,
+    "local_error": null,
+    "error": null,
+    "blocks": []
+  }
+}

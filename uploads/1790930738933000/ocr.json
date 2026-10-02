@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "capture_id": "1790930738933000",
+  "captured_at": "2026-10-02T08:45:48.028Z",
+  "image": {
+    "width": 512,
+    "height": 512,
+    "mime_type": "image/jpeg"
+  },
+  "tag_region": {
+    "left": 334,
+    "top": 165,
+    "right": 385,
+    "bottom": 230
+  },
+  "tag_texts": [
+    "024"
+  ],
+  "tag_detections": [
+    {
+      "left": 334,
+      "top": 165,
+      "right": 385,
+      "bottom": 230,
+      "confidence": 1,
+      "label": "cattle ear tag"
+    }
+  ],
+  "tag_crop": {
+    "width": 51,
+    "height": 65,
+    "mime_type": "image/png"
+  },
+  "ocr": {
+    "engine": "jaguzi_backend",
+    "tag_id": "024",
+    "text": "024",
+    "confidence": null,
+    "local_text": null,
+    "local_error": "On-device OCR is supported on Android and iOS.",
+    "error": null,
+    "blocks": []
+  }
+}

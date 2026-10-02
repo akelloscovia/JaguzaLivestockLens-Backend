@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "capture_id": "1790850957197000",
+  "captured_at": "2026-10-01T10:36:18.708Z",
+  "image": {
+    "width": 512,
+    "height": 512,
+    "mime_type": "image/jpeg"
+  },
+  "tag_region": {
+    "left": 38,
+    "top": 192,
+    "right": 103,
+    "bottom": 245
+  },
+  "tag_texts": [
+    "BLITZ"
+  ],
+  "tag_detections": [
+    {
+      "left": 38,
+      "top": 192,
+      "right": 103,
+      "bottom": 245,
+      "confidence": 1,
+      "label": "cattle ear tag"
+    }
+  ],
+  "tag_crop": {
+    "width": 65,
+    "height": 53,
+    "mime_type": "image/png"
+  },
+  "ocr": {
+    "engine": "jaguzi_backend",
+    "tag_id": "BLITZ",
+    "text": "BLITZ",
+    "confidence": null,
+    "local_text": null,
+    "local_error": "On-device OCR is supported on Android and iOS.",
+    "error": null,
+    "blocks": []
+  }
+}
