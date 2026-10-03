@@ -51,6 +51,10 @@ UPLOAD_DIRECTORY = Path(
 IMAGES_DIRECTORY = Path(
     os.environ.get("JAGUZA_IMAGES_DIR", Path(__file__).with_name("images"))
 )
+JAGUZA_FARM_API_URL = os.environ.get(
+    "JAGUZA_FARM_API_URL",
+    "https://backend.jaguzalivestockug.com/api/create_ear_tag_reading",
+).strip()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
@@ -324,11 +328,25 @@ class UploadHandler(BaseHTTPRequestHandler):
                 return
 
             image_file_bytes: bytes | None = None
+            capture_id = None
+            farm_id = None
+            animal_id = None
             for part in message.iter_parts():
                 name = part.get_param("name", header="content-disposition")
                 if name == "imageFile":
                     image_file_bytes = part.get_payload(decode=True) or b""
-                    break
+                elif name == "capture_id":
+                    capture_id = (part.get_payload(decode=True) or b"").decode(
+                        "utf-8", errors="replace"
+                    )
+                elif name == "farm_id":
+                    farm_id = (part.get_payload(decode=True) or b"").decode(
+                        "utf-8", errors="replace"
+                    )
+                elif name == "animal_id":
+                    animal_id = (part.get_payload(decode=True) or b"").decode(
+                        "utf-8", errors="replace"
+                    )
 
             if not image_file_bytes:
                 self._send_json(400, {"error": "The imageFile field is required."})
@@ -354,6 +372,9 @@ class UploadHandler(BaseHTTPRequestHandler):
             except (binascii.Error, ValueError):
                 self._send_json(400, {"error": "imageBase64 is not valid base64."})
                 return
+            capture_id = payload.get("capture_id")
+            farm_id = payload.get("farm_id")
+            animal_id = payload.get("animal_id")
 
         workflow_body = json.dumps(
             {"inputs": {"image": {"type": "base64", "value": image_base64}}}
@@ -459,14 +480,107 @@ class UploadHandler(BaseHTTPRequestHandler):
 
         #OPEN AI TAG READING CHANGES - END
 
+        #JAGUZA FARM FORWARDING CHANGES - START
+
+        jaguza_farm_sync = self._forward_to_jaguza_farm(
+            capture_id=capture_id,
+            farm_id=farm_id,
+            animal_id=animal_id,
+            roboflow_reading=roboflow_reading,
+            openai_reading=openai_reading,
+            image_subdirectory=image_subdirectory,
+        )
+
+        #JAGUZA FARM FORWARDING CHANGES - END
+
         self._send_json(
             200,
             {
                 "roboflow_reading": roboflow_reading,
                 "openai_reading": openai_reading,
                 "pictures": pictures,
+                "jaguza_farm_sync": jaguza_farm_sync,
             },
         )
+
+    def _forward_to_jaguza_farm(
+        self,
+        capture_id: object,
+        farm_id: object,
+        animal_id: object,
+        roboflow_reading: dict,
+        openai_reading: dict,
+        image_subdirectory: Path,
+    ) -> dict[str, object]:
+        if not JAGUZA_FARM_API_URL:
+            return {"error": "JAGUZA_FARM_API_URL is not configured."}
+
+        fields: dict[str, str] = {
+            "roboflow_reading": json.dumps(roboflow_reading),
+            "openai_reading": json.dumps(openai_reading),
+        }
+        if capture_id:
+            fields["capture_id"] = str(capture_id)
+        if farm_id:
+            fields["farm_id"] = str(farm_id)
+        if animal_id:
+            fields["animal_id"] = str(animal_id)
+
+        files: dict[str, tuple[str, str, bytes]] = {}
+        for field_name, filename in (
+            ("picture_original", "original.jpg"),
+            ("picture_annotated", "annotated.jpg"),
+            ("picture_cropped", "cropped.jpg"),
+        ):
+            file_path = image_subdirectory / filename
+            if file_path.is_file():
+                files[field_name] = (filename, "image/jpeg", file_path.read_bytes())
+
+        boundary = uuid4().hex
+        body = BytesIO()
+        for name, value in fields.items():
+            body.write(f"--{boundary}\r\n".encode("utf-8"))
+            body.write(
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(
+                    "utf-8"
+                )
+            )
+            body.write(value.encode("utf-8"))
+            body.write(b"\r\n")
+        for name, (filename, content_type, file_bytes) in files.items():
+            body.write(f"--{boundary}\r\n".encode("utf-8"))
+            body.write(
+                (
+                    f'Content-Disposition: form-data; name="{name}"; '
+                    f'filename="{filename}"\r\n'
+                    f"Content-Type: {content_type}\r\n\r\n"
+                ).encode("utf-8")
+            )
+            body.write(file_bytes)
+            body.write(b"\r\n")
+        body.write(f"--{boundary}--\r\n".encode("utf-8"))
+
+        request = Request(
+            JAGUZA_FARM_API_URL,
+            data=body.getvalue(),
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                return json.loads(response.read())
+        except HTTPError as error:
+            detail = error.read(2048).decode("utf-8", errors="replace")
+            return {
+                "error": f"Jaguza Farm backend returned HTTP {error.code}.",
+                "detail": detail,
+            }
+        except (URLError, TimeoutError, OSError) as error:
+            return {"error": f"Could not reach Jaguza Farm backend: {error}"}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {"error": "Jaguza Farm backend returned invalid JSON."}
 
     def _read_tag_with_openai(self, image_bytes: bytes) -> dict[str, object]:
         if not OPENAI_API_KEY:
