@@ -14,6 +14,10 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from io import BytesIO
+
+from PIL import Image
+
 
 def load_local_env() -> None:
     env_path = Path(__file__).with_name(".env")
@@ -43,6 +47,32 @@ ROBOFLOW_WORKFLOW_URL = os.environ.get(
 ).strip()
 UPLOAD_DIRECTORY = Path(
     os.environ.get("JAGUZA_UPLOAD_DIR", Path(__file__).with_name("uploads"))
+)
+IMAGES_DIRECTORY = Path(
+    os.environ.get("JAGUZA_IMAGES_DIR", Path(__file__).with_name("images"))
+)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_TAG_PROMPT = (
+    "You are looking at a cropped photo of a cattle ear tag. "
+    "tag_text should contain everything printed on the tag, including any name, "
+    "word, and number, exactly as it appears (e.g. 'BLITZ 1527'). "
+    "Some official tags (e.g. USDA/AIN tags) print two numbers: a long full official "
+    "ID (often in groups, e.g. '840 003 127 152 810') and a shorter visual number "
+    "that is usually the last several digits of the full ID (e.g. '52810'). "
+    "tag_number should contain just the short visual number, digits only, as a "
+    "string, or null if there is no number on the tag. "
+    "tag_official_number should contain the full official ID if one is printed, "
+    "digits only with no spaces (e.g. '840003127152810'), or null if there isn't a "
+    "separate full official number (for example, if the tag only has one number, "
+    "put it in tag_number and leave tag_official_number null). "
+    "Identify the primary color of the tag material. If a farm name or identifier is "
+    "visible on the tag, include it; otherwise use null for that field. "
+    "Respond with ONLY compact JSON, no markdown, in exactly this shape: "
+    '{"tag_text": string or null, "tag_number": string or null, '
+    '"tag_official_number": string or null, "tag_color": string or null, '
+    '"farm": string or null}'
 )
 IMAGE_EXTENSIONS = {
     "image/jpeg": ".jpg",
@@ -99,17 +129,42 @@ class UploadHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
-        if self.path != "/health":
-            self._send_json(404, {"error": "Not found."})
+        if self.path == "/health":
+            self._send_json(
+                200,
+                {
+                    "status": "ready",
+                    "model_configured": bool(
+                        os.environ.get("ROBOFLOW_API_KEY", "").strip()
+                    ),
+                    "workflow_url": ROBOFLOW_WORKFLOW_URL,
+                },
+            )
             return
-        self._send_json(
-            200,
-            {
-                "status": "ready",
-                "model_configured": bool(os.environ.get("ROBOFLOW_API_KEY", "").strip()),
-                "workflow_url": ROBOFLOW_WORKFLOW_URL,
-            },
-        )
+        if self.path.startswith("/images/"):
+            self._serve_image(self.path[len("/images/"):])
+            return
+        self._send_json(404, {"error": "Not found."})
+
+    def _serve_image(self, relative_path: str) -> None:
+        relative_path = relative_path.split("?", 1)[0]
+        candidate = (IMAGES_DIRECTORY / relative_path).resolve()
+        images_root = IMAGES_DIRECTORY.resolve()
+        if images_root not in candidate.parents or not candidate.is_file():
+            self._send_json(404, {"error": "Image not found."})
+            return
+        content_type = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+        }.get(candidate.suffix.lower(), "application/octet-stream")
+        body = candidate.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self) -> None:
         if self.path == "/api/read-ear-tag":
@@ -253,23 +308,52 @@ class UploadHandler(BaseHTTPRequestHandler):
             self._send_json(413, {"error": "Image exceeds the 32 MB limit."})
             return
 
-        try:
-            payload = json.loads(self.rfile.read(content_length))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self._send_json(400, {"error": "Request body must be valid JSON."})
-            return
-        if not isinstance(payload, dict):
-            self._send_json(400, {"error": "Request body must be a JSON object."})
-            return
-        image_base64 = payload.get("imageBase64")
-        if not isinstance(image_base64, str) or not image_base64:
-            self._send_json(400, {"error": "imageBase64 is required."})
-            return
-        try:
-            base64.b64decode(image_base64, validate=True)
-        except (binascii.Error, ValueError):
-            self._send_json(400, {"error": "imageBase64 is not valid base64."})
-            return
+        content_type = self.headers.get("Content-Type", "")
+        body = self.rfile.read(content_length)
+
+        if content_type.lower().startswith("multipart/form-data;"):
+            raw_message = (
+                f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode(
+                    "latin-1"
+                )
+                + body
+            )
+            message = BytesParser(policy=policy.default).parsebytes(raw_message)
+            if not message.is_multipart():
+                self._send_json(400, {"error": "Invalid multipart body."})
+                return
+
+            image_file_bytes: bytes | None = None
+            for part in message.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                if name == "imageFile":
+                    image_file_bytes = part.get_payload(decode=True) or b""
+                    break
+
+            if not image_file_bytes:
+                self._send_json(400, {"error": "The imageFile field is required."})
+                return
+            image_base64 = base64.b64encode(image_file_bytes).decode("ascii")
+        else:
+            try:
+                payload = json.loads(body)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self._send_json(400, {"error": "Request body must be valid JSON."})
+                return
+            if not isinstance(payload, dict):
+                self._send_json(400, {"error": "Request body must be a JSON object."})
+                return
+            image_base64 = payload.get("imageBase64")
+            if not isinstance(image_base64, str) or not image_base64:
+                self._send_json(
+                    400, {"error": "imageBase64 or imageFile is required."}
+                )
+                return
+            try:
+                base64.b64decode(image_base64, validate=True)
+            except (binascii.Error, ValueError):
+                self._send_json(400, {"error": "imageBase64 is not valid base64."})
+                return
 
         workflow_body = json.dumps(
             {"inputs": {"image": {"type": "base64", "value": image_base64}}}
@@ -305,7 +389,190 @@ class UploadHandler(BaseHTTPRequestHandler):
             return
 
         normalized_result = normalize_workflow_result(workflow_result)
-        self._send_json(200, normalized_result)
+
+        #PROCESSING CHANGES - START
+
+        picture_original_b64 = image_base64
+        picture_annotated_b64 = None
+        first_detection: dict | None = None
+        if isinstance(normalized_result, dict):
+            outputs = normalized_result.get("outputs")
+            if isinstance(outputs, list) and outputs and isinstance(outputs[0], dict):
+                picture_annotated_b64 = outputs[0].get("output_image")
+                detections = outputs[0].get("tag_detections")
+                if isinstance(detections, list) and detections and isinstance(
+                    detections[0], dict
+                ):
+                    first_detection = detections[0]
+
+        #PROCESSING CHANGES - END
+
+        #PHOTO SYNC CHANGES - START
+
+        image_id = uuid4().hex
+        image_subdirectory = IMAGES_DIRECTORY / image_id
+        image_subdirectory.mkdir(parents=True, exist_ok=True)
+
+        picture_original_url = self._save_base64_image(
+            picture_original_b64, image_subdirectory / "original.jpg"
+        )
+        picture_annotated_url = self._save_base64_image(
+            picture_annotated_b64, image_subdirectory / "annotated.jpg"
+        )
+        picture_cropped_url = self._save_cropped_image(
+            picture_original_b64, first_detection, image_subdirectory / "cropped.jpg"
+        )
+
+        #PHOTO SYNC CHANGES - END
+
+        #ADD RESPONSE FILES CHANGES - START
+
+        roboflow_reading = dict(normalized_result) if isinstance(normalized_result, dict) else {
+            "result": normalized_result
+        }
+        outputs = roboflow_reading.get("outputs")
+        if isinstance(outputs, list):
+            roboflow_reading["outputs"] = [
+                {k: v for k, v in output.items() if k != "output_image"}
+                if isinstance(output, dict)
+                else output
+                for output in outputs
+            ]
+
+        pictures = {
+            "original": picture_original_url,
+            "annotated": picture_annotated_url,
+            "cropped": picture_cropped_url,
+        }
+
+        #ADD RESPONSE FILES CHANGES - END
+
+        #OPEN AI TAG READING CHANGES - START
+
+        cropped_path = image_subdirectory / "cropped.jpg"
+        if cropped_path.is_file():
+            openai_reading = self._read_tag_with_openai(cropped_path.read_bytes())
+        else:
+            openai_reading = {
+                "error": "No cropped tag image was available to analyze."
+            }
+
+        #OPEN AI TAG READING CHANGES - END
+
+        self._send_json(
+            200,
+            {
+                "roboflow_reading": roboflow_reading,
+                "openai_reading": openai_reading,
+                "pictures": pictures,
+            },
+        )
+
+    def _read_tag_with_openai(self, image_bytes: bytes) -> dict[str, object]:
+        if not OPENAI_API_KEY:
+            return {"error": "OPENAI_API_KEY is not configured on the local server."}
+
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        body = json.dumps(
+            {
+                "model": OPENAI_MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": OPENAI_TAG_PROMPT},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_b64}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+                "max_tokens": 300,
+                "temperature": 0,
+            }
+        ).encode("utf-8")
+        request = Request(
+            OPENAI_CHAT_URL,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=60) as response:
+                result = json.loads(response.read())
+        except HTTPError as error:
+            detail = error.read(2048).decode("utf-8", errors="replace")
+            return {
+                "error": f"OpenAI returned HTTP {error.code}.",
+                "detail": detail,
+            }
+        except (URLError, TimeoutError, OSError) as error:
+            return {"error": f"Could not reach OpenAI: {error}"}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {"error": "OpenAI returned invalid JSON."}
+
+        try:
+            content = result["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            return {"error": "Unexpected OpenAI response shape."}
+
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip())
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            return {"error": "Could not parse OpenAI response as JSON.", "raw": content}
+        if not isinstance(parsed, dict):
+            return {"error": "OpenAI response JSON was not an object.", "raw": content}
+        return parsed
+
+    def _save_cropped_image(
+        self, original_b64: object, detection: dict | None, destination: Path
+    ) -> str | None:
+        if not isinstance(original_b64, str) or not original_b64 or detection is None:
+            return None
+        try:
+            center_x = float(detection["x"])
+            center_y = float(detection["y"])
+            width = float(detection["width"])
+            height = float(detection["height"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        try:
+            original_bytes = base64.b64decode(original_b64, validate=True)
+            with Image.open(BytesIO(original_bytes)) as original:
+                image_width, image_height = original.size
+                left = max(0, int(center_x - width / 2))
+                top = max(0, int(center_y - height / 2))
+                right = min(image_width, int(center_x + width / 2))
+                bottom = min(image_height, int(center_y + height / 2))
+                if right <= left or bottom <= top:
+                    return None
+                cropped = original.convert("RGB").crop((left, top, right, bottom))
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                cropped.save(destination, format="JPEG")
+        except (binascii.Error, ValueError, OSError):
+            return None
+        host = self.headers.get("Host", f"{HOST}:{PORT}")
+        relative_path = destination.relative_to(IMAGES_DIRECTORY).as_posix()
+        return f"http://{host}/images/{relative_path}"
+
+    def _save_base64_image(self, value: object, destination: Path) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            image_bytes = base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError):
+            return None
+        destination.write_bytes(image_bytes)
+        host = self.headers.get("Host", f"{HOST}:{PORT}")
+        relative_path = destination.relative_to(IMAGES_DIRECTORY).as_posix()
+        return f"http://{host}/images/{relative_path}"
 
 
 def normalize_workflow_result(result: object) -> object:
@@ -335,6 +602,7 @@ def normalize_workflow_result(result: object) -> object:
 
 if __name__ == "__main__":
     UPLOAD_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    IMAGES_DIRECTORY.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer((HOST, PORT), UploadHandler)
     print(f"Jaguza upload API listening on http://{HOST}:{PORT}")
     print(f"Uploads are saved to {UPLOAD_DIRECTORY.resolve()}")
